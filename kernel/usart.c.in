@@ -1,0 +1,271 @@
+// -*- mode: c -*-
+/* This file is part of the OS kernel included with the Apollo firmware 
+	 Copyright (C) 2016  Espen S. Johnsen, LA7DJA
+
+	 This program is free software: you can redistribute it and/or modify
+	 it under the terms of the GNU General Public License as published by
+	 the Free Software Foundation, either version 3 of the License, or
+	 (at your option) any later version.
+	 
+	 This program is distributed in the hope that it will be useful,
+	 but WITHOUT ANY WARRANTY; without even the implied warranty of
+	 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+	 GNU General Public License for more details.
+	 
+	 You should have received a copy of the GNU General Public License
+	 along with this program.  If not, see <http://www.gnu.org/licenses/>. */
+
+#include <avr/io.h>
+#include <avr/signal.h>
+#include <avr/power.h>
+
+#include <kernel/ports.h>
+#include <kernel/usart.h>
+
+#ifdef USART0_SPI_SUPPORT
+#if defined (__AVR_ATmega328P__) || defined (__AVR_ATmega328__)
+#define XCK0 D, 4
+#endif
+#endif
+
+
+static timeout_t usart_rx_timeout;
+
+static void usart_init (uint32_t baudrate, usart_params_t params)
+{
+  power_usart<n>_enable();
+  
+  uint32_t ubrr = 0;
+
+  UCSR<n>A = UCSR<n>B = UCSR<n>C = 0;
+
+#ifdef USART<n>_SPI_SUPPORT
+  if ((params & USART_SLAVE || params & USART_MASTER) &&
+      params & USART_POLARITY_INVERTED)
+    set_bit(UCSR<n>C, UCPOL<n>);
+	
+  if (params & USART_SLAVE) {
+    make_input(XCK<n>);
+  } else if (params & USART_MASTER) {
+    ubrr = F_CPU / CLK_DIV / (2L * baudrate) - 1;
+    set_bit(UCSR<n>C, UMSEL<n>0);
+    make_output(XCK<n>);
+  } else 
+#endif
+	{
+    ubrr =  F_CPU / CLK_DIV / (16L * baudrate) - 1;
+    if (ubrr > 4095) {
+      set_bit(UCSR<n>A, U2X<n>);
+      ubrr = F_CPU / CLK_DIV / (8L * baudrate) - 1;
+      ASSERT(ubrr <= 4095);
+    }
+  }
+
+  UBRR<n> = ubrr;
+      
+  if (params & USART_RX) {
+    usart_rx_timeout = -1;
+    UCSR<n>B |= _BV(RXCIE<n>) | _BV(RXEN<n>);
+  }
+  if (params & USART_TX) {
+    UCSR<n>B |= _BV(TXEN<n>);
+  }
+  
+  switch (params & (USART_EVEN_PARITY | USART_ODD_PARITY)) {
+		case USART_EVEN_PARITY: set_bit(UCSR<n>C, UPM<n>1); break;
+		case USART_ODD_PARITY: set_bit(UCSR<n>C, UPM<n>0); break;
+  }
+  if (params & USART_2_STOP_BITS)
+    set_bit(UCSR<n>C, USBS<n>);
+#ifdef USART<n>_9_BITS_SUPPORT
+  switch (params & (USART_5_BITS | USART_6_BITS | USART_7_BITS | USART_9_BITS)) 
+#else
+  switch (params & (USART_5_BITS | USART_6_BITS | USART_7_BITS))
+#endif
+  {
+		case USART_6_BITS: set_bit (UCSR<n>C, UCSZ<n>0); break;
+		case USART_7_BITS: set_bit (UCSR<n>C, UCSZ<n>1); break;
+		case USART_8_BITS: set_bit (UCSR<n>C, UCSZ<n>0);
+			set_bit(UCSR<n>C, UCSZ<n>1); break;
+#ifdef USART<n>_9_BITS_SUPPORT
+		case USART_9_BITS: set_bit(UCSR<n>B, UCSZ<n>2);
+#endif
+  }
+}
+
+  
+#ifdef USART<n>_DEBUG
+#ifndef USART<n>_DEBUG_BAUD
+#define USART<n>_DEBUG_BAUD 38400
+#endif
+
+void debug_init ()
+{
+  usart_init(USART<n>_DEBUG_BAUD, USART_TX);
+}
+
+int debug_putchar (char ch, FILE *stream)
+{
+  while (bit_is_clear(UCSR<n>A, UDRE<n>))
+    ;
+  UDR<n> = ch;
+  return 0;
+}
+
+#else
+
+static task_t *wait_usart_tx;
+static task_t *wait_usart_rx;
+
+static void usart_devclose (FILE *stream);
+#ifdef USART<n>_9_BITS_SUPPORT
+static int usart_putchar (int ch, FILE *stream);
+#else
+static int usart_putchar (char ch, FILE *stream);
+#endif
+static int usart_getchar (FILE *stream);
+static int usart_flush (FILE *stream);
+
+#ifdef USART<n>_TX_BUFFER_SIZE
+#ifdef USART<n>_9_BITS_SUPPORT
+#error "Buffering not supported with 9 bit"
+#endif
+
+static task_t *wait_usart_tx_done;
+
+static uint8_t* usart_tx_buffer;
+static volatile uint8_t usart_tx_head, usart_tx_tail;
+#endif
+
+FILE *usart<n>_open (uint32_t baudrate, usart_params_t params)
+{
+  usart_init(baudrate, params);
+
+#ifdef USART<n>_TX_BUFFER_SIZE
+	usart_tx_buffer = malloc(USART<n>_TX_BUFFER_SIZE);
+	usart_tx_tail = USART<n>_TX_BUFFER_SIZE - 1;
+#endif
+	
+#ifdef USART<n>_9_BITS_SUPPORT
+	FILE *stream = fdevopen2(params & USART_TX ? usart_putchar : NULL,
+													 params & USART_RX ? usart_getchar : NULL);
+#else
+	FILE *stream = fdevopen(params & USART_TX ? usart_putchar : NULL,
+													params & USART_RX ? usart_getchar : NULL);
+#endif
+	
+  fdev_set_flush(stream, usart_flush);
+  fdev_set_devclose(stream, usart_devclose);
+
+  return stream;
+}
+
+void usart<n>_set_timeout (FILE *stream, timeout_t timeout)
+{
+  usart_rx_timeout = timeout;
+}
+ 
+static void usart_devclose (FILE *stream)
+{
+  UCSR<n>B = 0;
+  power_usart<n>_disable();
+}
+
+static int usart_flush (FILE *stream)
+{
+#ifdef USART<n>_TX_BUFFER_SIZE
+	ATOMIC_BLOCK (ATOMIC_FORCEON) {
+		if (!(usart_tx_tail + 1) % USART<n>_TX_BUFFER_SIZE) {
+			wait_usart_tx_done = current_task;
+			suspend();
+		}
+	}
+#endif
+	return 0;
+}
+
+static int usart_getchar (FILE *stream)
+{
+  if (!bit_is_set(UCSR<n>A, RXC<n>)) {
+    wait_usart_rx = current_task;
+    cli();
+    set_bit(UCSR<n>B, RXCIE<n>);
+    // TODO: handle timeout
+    suspend ();
+    clear_bit(UCSR<n>B, RXCIE<n>);
+  }
+  // TODO: read error flags in UCSR<n>A
+  int ch;
+#ifdef USART<n>_9_BITS_SUPPORT
+  if (bit_is_set(UCSR<n>B, UCSZ<n>2)) {
+    ch = bit_is_set(UCSR<n>B, RXB8<n>) ? 0x1f : 0;
+    ch |= UDR<n>;
+  } else
+#endif
+    ch = UDR<n>;
+
+  return ch;
+}
+
+char tx_buffer;
+
+#ifdef USART<n>_9_BITS_SUPPORT
+static int usart_putchar (int ch, FILE *stream)
+#else
+static int usart_putchar (char ch, FILE *stream)
+#endif
+{
+#ifdef USART<n>_TX_BUFFER_SIZE
+	ATOMIC_BLOCK (ATOMIC_FORCEON) {
+		if (usart_tx_head == usart_tx_tail) {
+			wait_usart_tx = current_task;
+			suspend();
+		}
+	}
+	usart_tx_buffer[usart_tx_head] = ch;
+	usart_tx_head = (usart_tx_head + 1) % USART<n>_TX_BUFFER_SIZE;
+	set_bit(UCSR<n>B, UDRIE<n>);	
+#else	
+  if (!bit_is_set(UCSR<n>A, UDRE<n>)) {
+    wait_usart_tx = current_task;
+		cli();
+		set_bit(UCSR<n>B, UDRIE<n>);
+		suspend();
+  }
+
+#ifdef USART<n>_9_BITS_SUPPORT
+  if (ch & 0x10)
+    set_bit(UCSR<n>B, TXB8<n>);
+  else
+    clear_bit(UCSR<n>B, TXB8<n>);
+#endif
+  
+  UDR<n> = ch;
+#endif
+	
+  return 0;
+}
+
+ISR_RESUME_TASK (USART_RX) {	return wait_usart_rx; }
+ISR_RESUME_TASK (USART_UDRE)
+{
+#ifdef USART<n>_TX_BUFFER_SIZE
+	uint8_t next = (usart_tx_tail + 1) % USART<n>_TX_BUFFER_SIZE;
+	if (next == usart_tx_head) {
+		clear_bit(UCSR<n>B, UDRIE<n>);
+		if (wait_usart_tx_done) return wait_usart_tx_done;
+	} else {
+		UDR<n> = usart_tx_buffer[next];
+		usart_tx_tail = next;
+	}
+
+	task_t *task = wait_usart_tx;
+	wait_usart_tx = NULL;
+	return task;
+#else
+	clear_bit(UCSR<n>B, UDRIE<n>);
+	return wait_usart_tx;
+#endif
+}
+
+#endif

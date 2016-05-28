@@ -1,0 +1,15 @@
+*~
+\#*
+.#*
+#*
+*.o
+*.lst
+*.hex
+*.elf
+*.bin
+*.obj
+*.obj
+*.lnk
+*.lss
+*.s
+.dep
